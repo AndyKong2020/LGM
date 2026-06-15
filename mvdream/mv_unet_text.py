@@ -22,13 +22,13 @@ except ImportError:
 from kiui.cam import orbit_camera
 
 def get_camera(
-    num_frames, elevation=0, azimuth_start=0, azimuth_span=360, blender_coord=True, extra_view=False,
+    num_frames, elevation=15, azimuth_start=0, azimuth_span=360, blender_coord=True, extra_view=False,
 ):
     angle_gap = azimuth_span / num_frames
     cameras = []
     for azimuth in np.arange(azimuth_start, azimuth_span + azimuth_start, angle_gap):
-        
-        pose = orbit_camera(elevation, azimuth, radius=1) # [4, 4]
+
+        pose = orbit_camera(-elevation, azimuth, radius=1) # kiui's elevation is negated, [4, 4]
 
         # opengl to blender
         if blender_coord:
@@ -144,17 +144,17 @@ class FeedForward(nn.Module):
 class MemoryEfficientCrossAttention(nn.Module):
     # https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
     def __init__(
-            self, 
-            query_dim, 
-            context_dim=None, 
-            heads=8, 
-            dim_head=64, 
+            self,
+            query_dim,
+            context_dim=None,
+            heads=8,
+            dim_head=64,
             dropout=0.0,
             ip_dim=0,
             ip_weight=1,
         ):
         super().__init__()
-        
+
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
@@ -242,7 +242,7 @@ class MemoryEfficientCrossAttention(nn.Module):
 
 
 class BasicTransformerBlock3D(nn.Module):
-    
+
     def __init__(
         self,
         dim,
@@ -273,7 +273,7 @@ class BasicTransformerBlock3D(nn.Module):
             # ip only applies to cross-attention
             ip_dim=ip_dim,
             ip_weight=ip_weight,
-        ) 
+        )
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
@@ -325,9 +325,9 @@ class SpatialTransformer3D(nn.Module):
                 for d in range(depth)
             ]
         )
-        
+
         self.proj_out = zero_module(nn.Linear(in_channels, inner_dim))
-        
+
 
     def forward(self, x, context=None, num_frames=1):
         # note: if no context is given, cross-attention defaults to self-attention
@@ -342,7 +342,7 @@ class SpatialTransformer3D(nn.Module):
             x = block(x, context=context[i], num_frames=num_frames)
         x = self.proj_out(x)
         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w).contiguous()
-        
+
         return x + x_in
 
 
@@ -687,7 +687,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
     ):
         super().__init__()
         assert context_dim is not None
-        
+
         if num_heads_upsample == -1:
             num_heads_upsample = num_heads
 
@@ -714,7 +714,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                     "as a list/tuple (per-level) with the same length as channel_mult"
                 )
             self.num_res_blocks = num_res_blocks
-        
+
         if num_attention_blocks is not None:
             assert len(num_attention_blocks) == len(self.num_res_blocks)
             assert all(
@@ -863,7 +863,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         else:
             num_heads = ch // num_head_channels
             dim_head = num_head_channels
-        
+
         self.middle_block = CondSequential(
             ResBlock(
                 ch,
@@ -880,7 +880,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                 depth=transformer_depth,
                 ip_dim=self.ip_dim,
                 ip_weight=self.ip_weight,
-            ), 
+            ),
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -998,7 +998,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         # Add camera embeddings
         if camera is not None:
             emb = emb + self.camera_embed(camera)
-        
+
         # imagedream variant
         if self.ip_dim > 0:
             x[(num_frames - 1) :: num_frames, :, :, :] = ip_img # place at [4, 9]

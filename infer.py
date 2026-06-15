@@ -18,12 +18,14 @@ from kiui.cam import orbit_camera
 
 from core.options import AllConfigs, Options
 from core.models import LGM
+from core.device import autocast_context, get_torch_device
 from mvdream.pipeline_mvdream import MVDreamPipeline
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 opt = tyro.cli(AllConfigs)
+opt.lambda_lpips = 0
 
 # model
 model = LGM(opt)
@@ -40,7 +42,7 @@ else:
     print(f'[WARN] model randomly initialized, are you sure?')
 
 # device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = get_torch_device()
 model = model.half().to(device)
 model.eval()
 
@@ -54,17 +56,27 @@ proj_matrix[2, 2] = (opt.zfar + opt.znear) / (opt.zfar - opt.znear)
 proj_matrix[3, 2] = - (opt.zfar * opt.znear) / (opt.zfar - opt.znear)
 proj_matrix[2, 3] = 1
 
-# load image dream
-pipe = MVDreamPipeline.from_pretrained(
-    "ashawkey/imagedream-ipmv-diffusers", # remote weights
-    torch_dtype=torch.float16,
-    trust_remote_code=True,
-    # local_files_only=True,
-)
-pipe = pipe.to(device)
+pipe = None
+bg_remover = None
+IMAGE_MODEL_ID = os.environ.get('LGM_IMAGEDREAM_MODEL', 'ashawkey/imagedream-ipmv-diffusers')
 
-# load rembg
-bg_remover = rembg.new_session()
+
+def get_image_pipe():
+    global pipe
+    if pipe is None:
+        pipe = MVDreamPipeline.from_pretrained(
+            IMAGE_MODEL_ID,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+        ).to(device)
+    return pipe
+
+
+def get_bg_remover():
+    global bg_remover
+    if bg_remover is None:
+        bg_remover = rembg.new_session()
+    return bg_remover
 
 # process function
 def process(opt: Options, path):
@@ -75,7 +87,7 @@ def process(opt: Options, path):
     input_image = kiui.read_image(path, mode='uint8')
 
     # bg removal
-    carved_image = rembg.remove(input_image, session=bg_remover) # [H, W, 4]
+    carved_image = rembg.remove(input_image, session=get_bg_remover()) # [H, W, 4]
     mask = carved_image[..., -1] > 0
 
     # recenter
@@ -88,7 +100,8 @@ def process(opt: Options, path):
     if image.shape[-1] == 4:
         image = image[..., :3] * image[..., 3:4] + (1 - image[..., 3:4])
 
-    mv_image = pipe('', image, guidance_scale=5.0, num_inference_steps=30, elevation=0)
+    num_inference_steps = int(os.environ.get("LGM_INFER_STEPS", "30"))
+    mv_image = get_image_pipe()('', image, guidance_scale=5.0, num_inference_steps=num_inference_steps, elevation=0, device=device)
     mv_image = np.stack([mv_image[1], mv_image[2], mv_image[3], mv_image[0]], axis=0) # [4, 256, 256, 3], float32
 
     # generate gaussians
@@ -99,7 +112,7 @@ def process(opt: Options, path):
     input_image = torch.cat([input_image, rays_embeddings], dim=1).unsqueeze(0) # [1, 4, 9, H, W]
 
     with torch.no_grad():
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        with autocast_context(device, dtype=torch.float16):
             # generate gaussians
             gaussians = model.forward_gaussians(input_image)
         

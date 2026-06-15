@@ -4,20 +4,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from diff_gaussian_rasterization import (
-    GaussianRasterizationSettings,
-    GaussianRasterizer,
-)
+try:
+    from diff_gaussian_rasterization import (
+        GaussianRasterizationSettings,
+        GaussianRasterizer,
+    )
+    DIFF_GAUSSIAN_AVAILABLE = True
+except ImportError:
+    GaussianRasterizationSettings = None
+    GaussianRasterizer = None
+    DIFF_GAUSSIAN_AVAILABLE = False
 
 from core.options import Options
+from core.device import get_torch_device
 
-import kiui
+from kiui.op import inverse_sigmoid
 
 class GaussianRenderer:
     def __init__(self, opt: Options):
         
         self.opt = opt
-        self.bg_color = torch.tensor([1, 1, 1], dtype=torch.float32, device="cuda")
+        self.device = get_torch_device()
+        self.bg_color = torch.tensor([1, 1, 1], dtype=torch.float32, device=self.device)
         
         # intrinsics
         self.tan_half_fov = np.tan(0.5 * np.deg2rad(self.opt.fovy))
@@ -35,6 +43,8 @@ class GaussianRenderer:
 
         device = gaussians.device
         B, V = cam_view.shape[:2]
+        if not DIFF_GAUSSIAN_AVAILABLE or device.type != "cuda":
+            return self._render_torch(gaussians, cam_view_proj, bg_color=bg_color)
 
         # loop of loop...
         images = []
@@ -97,6 +107,65 @@ class GaussianRenderer:
             "alpha": alphas, # [B, V, 1, H, W]
         }
 
+    def _render_torch(self, gaussians, cam_view_proj, bg_color=None):
+        # A portability fallback for non-CUDA devices. It projects gaussians as
+        # weighted points, so it is meant for smoke tests and WebUI previews.
+        out_device = gaussians.device
+        B, V = cam_view_proj.shape[:2]
+        H = W = self.opt.output_size
+        bg = self.bg_color if bg_color is None else bg_color
+        bg = bg.detach().float().cpu().clamp(0, 1)
+
+        images = []
+        alphas = []
+        for b in range(B):
+            points = gaussians[b].detach().float().cpu()
+            means3D = points[:, 0:3]
+            opacity = points[:, 3].clamp(0, 1)
+            rgbs = points[:, 11:].clamp(0, 1)
+
+            ones = torch.ones((means3D.shape[0], 1), dtype=means3D.dtype)
+            means_h = torch.cat([means3D, ones], dim=-1)
+
+            for v in range(V):
+                view_proj = cam_view_proj[b, v].detach().float().cpu()
+                clip = means_h @ view_proj
+                w = clip[:, 3]
+                valid = w.abs() > 1e-6
+                safe_w = torch.where(valid, w, torch.ones_like(w))
+                ndc = clip[:, :3] / safe_w.unsqueeze(-1)
+                valid = valid & (ndc[:, 0].abs() <= 1.2) & (ndc[:, 1].abs() <= 1.2)
+
+                flat_image = torch.ones((H * W, 3), dtype=torch.float32) * bg.view(1, 3)
+                flat_alpha = torch.zeros((H * W,), dtype=torch.float32)
+                if valid.any():
+                    x = ((ndc[valid, 0] * 0.5 + 0.5) * (W - 1)).round().long().clamp(0, W - 1)
+                    y = ((1 - (ndc[valid, 1] * 0.5 + 0.5)) * (H - 1)).round().long().clamp(0, H - 1)
+                    flat = y * W + x
+                    weights = opacity[valid]
+
+                    color_accum = torch.zeros((H * W, 3), dtype=torch.float32)
+                    alpha_accum = torch.zeros((H * W,), dtype=torch.float32)
+                    color_accum.index_add_(0, flat, rgbs[valid] * weights.unsqueeze(-1))
+                    alpha_accum.index_add_(0, flat, weights)
+
+                    covered = alpha_accum > 1e-6
+                    averaged = color_accum[covered] / alpha_accum[covered].unsqueeze(-1)
+                    alpha = alpha_accum[covered].clamp(0, 1).unsqueeze(-1)
+                    flat_image[covered] = averaged * alpha + bg.view(1, 3) * (1 - alpha)
+                    flat_alpha[covered] = alpha_accum[covered].clamp(0, 1)
+
+                images.append(flat_image.view(H, W, 3).permute(2, 0, 1).to(out_device))
+                alphas.append(flat_alpha.view(1, H, W).to(out_device))
+
+        images = torch.stack(images, dim=0).view(B, V, 3, H, W)
+        alphas = torch.stack(alphas, dim=0).view(B, V, 1, H, W)
+
+        return {
+            "image": images,
+            "alpha": alphas,
+        }
+
 
     def save_ply(self, gaussians, path, compatible=True):
         # gaussians: [B, N, 14]
@@ -122,7 +191,7 @@ class GaussianRenderer:
 
         # invert activation to make it compatible with the original ply format
         if compatible:
-            opacity = kiui.op.inverse_sigmoid(opacity)
+            opacity = inverse_sigmoid(opacity)
             scales = torch.log(scales + 1e-8)
             shs = (shs - 0.5) / 0.28209479177387814
 

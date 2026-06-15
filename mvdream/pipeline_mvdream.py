@@ -446,8 +446,11 @@ class MVDreamPipeline(DiffusionPipeline):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         num_frames: int = 4,
-        device=torch.device("cuda:0"),
+        device=None,
     ):
+        if device is None:
+            device = self._execution_device
+
         self.unet = self.unet.to(device=device)
         self.vae = self.vae.to(device=device)
         self.text_encoder = self.text_encoder.to(device=device)

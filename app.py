@@ -17,6 +17,7 @@ from kiui.cam import orbit_camera
 
 from core.options import AllConfigs, Options
 from core.models import LGM
+from core.device import autocast_context, get_torch_device
 from mvdream.pipeline_mvdream import MVDreamPipeline
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
@@ -25,6 +26,7 @@ GRADIO_VIDEO_PATH = 'gradio_output.mp4'
 GRADIO_PLY_PATH = 'gradio_output.ply'
 
 opt = tyro.cli(AllConfigs)
+opt.lambda_lpips = 0
 
 # model
 model = LGM(opt)
@@ -40,7 +42,7 @@ if opt.resume is not None:
 else:
     print(f'[WARN] model randomly initialized, are you sure?')
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = get_torch_device()
 model = model.half().to(device)
 model.eval()
 
@@ -52,25 +54,40 @@ proj_matrix[2, 2] = (opt.zfar + opt.znear) / (opt.zfar - opt.znear)
 proj_matrix[3, 2] = - (opt.zfar * opt.znear) / (opt.zfar - opt.znear)
 proj_matrix[2, 3] = 1
 
-# load dreams
-pipe_text = MVDreamPipeline.from_pretrained(
-    'ashawkey/mvdream-sd2.1-diffusers', # remote weights
-    torch_dtype=torch.float16,
-    trust_remote_code=True,
-    # local_files_only=True,
-)
-pipe_text = pipe_text.to(device)
+pipe_text = None
+pipe_image = None
+bg_remover = None
+TEXT_MODEL_ID = os.environ.get('LGM_MVDREAM_MODEL', 'ashawkey/mvdream-sd2.1-diffusers')
+IMAGE_MODEL_ID = os.environ.get('LGM_IMAGEDREAM_MODEL', 'ashawkey/imagedream-ipmv-diffusers')
 
-pipe_image = MVDreamPipeline.from_pretrained(
-    "ashawkey/imagedream-ipmv-diffusers", # remote weights
-    torch_dtype=torch.float16,
-    trust_remote_code=True,
-    # local_files_only=True,
-)
-pipe_image = pipe_image.to(device)
 
-# load rembg
-bg_remover = rembg.new_session()
+def get_text_pipe():
+    global pipe_text
+    if pipe_text is None:
+        pipe_text = MVDreamPipeline.from_pretrained(
+            TEXT_MODEL_ID,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+        ).to(device)
+    return pipe_text
+
+
+def get_image_pipe():
+    global pipe_image
+    if pipe_image is None:
+        pipe_image = MVDreamPipeline.from_pretrained(
+            IMAGE_MODEL_ID,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+        ).to(device)
+    return pipe_image
+
+
+def get_bg_remover():
+    global bg_remover
+    if bg_remover is None:
+        bg_remover = rembg.new_session()
+    return bg_remover
 
 # process function
 def process(input_image, prompt, prompt_neg='', input_elevation=0, input_num_steps=30, input_seed=42):
@@ -84,12 +101,13 @@ def process(input_image, prompt, prompt_neg='', input_elevation=0, input_num_ste
 
     # text-conditioned
     if input_image is None:
-        mv_image_uint8 = pipe_text(prompt, negative_prompt=prompt_neg, num_inference_steps=input_num_steps, guidance_scale=7.5, elevation=input_elevation)
+        pipe = get_text_pipe()
+        mv_image_uint8 = pipe(prompt, negative_prompt=prompt_neg, num_inference_steps=input_num_steps, guidance_scale=7.5, elevation=input_elevation, device=device)
         mv_image_uint8 = (mv_image_uint8 * 255).astype(np.uint8)
         # bg removal
         mv_image = []
         for i in range(4):
-            image = rembg.remove(mv_image_uint8[i], session=bg_remover) # [H, W, 4]
+            image = rembg.remove(mv_image_uint8[i], session=get_bg_remover()) # [H, W, 4]
             # to white bg
             image = image.astype(np.float32) / 255
             image = recenter(image, image[..., 0] > 0, border_ratio=0.2)
@@ -99,12 +117,13 @@ def process(input_image, prompt, prompt_neg='', input_elevation=0, input_num_ste
     else:
         input_image = np.array(input_image) # uint8
         # bg removal
-        carved_image = rembg.remove(input_image, session=bg_remover) # [H, W, 4]
+        carved_image = rembg.remove(input_image, session=get_bg_remover()) # [H, W, 4]
         mask = carved_image[..., -1] > 0
         image = recenter(carved_image, mask, border_ratio=0.2)
         image = image.astype(np.float32) / 255.0
         image = image[..., :3] * image[..., 3:4] + (1 - image[..., 3:4])
-        mv_image = pipe_image(prompt, image, negative_prompt=prompt_neg, num_inference_steps=input_num_steps, guidance_scale=5.0,  elevation=input_elevation)
+        pipe = get_image_pipe()
+        mv_image = pipe(prompt, image, negative_prompt=prompt_neg, num_inference_steps=input_num_steps, guidance_scale=5.0, elevation=input_elevation, device=device)
         
     mv_image_grid = np.concatenate([
         np.concatenate([mv_image[1], mv_image[2]], axis=1),
@@ -121,7 +140,7 @@ def process(input_image, prompt, prompt_neg='', input_elevation=0, input_num_ste
     input_image = torch.cat([input_image, rays_embeddings], dim=1).unsqueeze(0) # [1, 4, 9, H, W]
 
     with torch.no_grad():
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        with autocast_context(device, dtype=torch.float16):
             # generate gaussians
             gaussians = model.forward_gaussians(input_image)
         
@@ -246,4 +265,10 @@ with block:
         label='Text-to-3D Examples'
     )
     
-block.launch(server_name="0.0.0.0", share=False)
+block.launch(
+    server_name=os.environ.get("LGM_GRADIO_HOST", "0.0.0.0"),
+    server_port=int(os.environ.get("LGM_GRADIO_PORT", "7860")),
+    share=False,
+    allowed_paths=[opt.workspace],
+    show_error=True,
+)
